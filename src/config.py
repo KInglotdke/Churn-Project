@@ -16,5 +16,5 @@ DROP_COLUMNS = [
     "Surname"
 ]
 
-RANDOM_STATE = 42
+RANDOM_STATE = 80
 TEST_SIZE = 0.2
