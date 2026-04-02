@@ -1,4 +1,7 @@
-from src.train import train_and_save_model
+from src.train import run_training_pipeline
 
 if __name__ == "__main__":
-    train_and_save_model()
+    benchmark_df, best_model_name = run_training_pipeline()
+    print("\n=== Model Benchmark ===")
+    print(benchmark_df)
+    print(f"\nBest model: {best_model_name}")

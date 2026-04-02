@@ -1,113 +1,115 @@
-import joblib
-import pandas as pd
+from pathlib import Path
 
-from sklearn.compose import ColumnTransformer
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
-from sklearn.impute import SimpleImputer
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import (
-    accuracy_score,
-    precision_score,
-    recall_score,
-    f1_score,
-    roc_auc_score,
-    classification_report,
+from src.config import (
+    DATA_PATH,
+    REPORTS_DIR,
+    METRICS_DIR,
+    FIGURES_DIR,
+    LOGS_DIR,
+    MODELS_DIR,
+    RANDOM_STATE,
+    BENCHMARK_CSV,
+    BENCHMARK_JSON,
+    BEST_MODEL_FILENAME,
 )
-
-from src.config import MODELS_DIR, REPORTS_DIR
-from src.data import load_data, prepare_features_and_target, split_data, get_column_types
-from src.utils import ensure_dir, save_json
-
-
-def build_preprocessor(X: pd.DataFrame) -> ColumnTransformer:
-    categorical_cols, numerical_cols = get_column_types(X)
-
-    numeric_pipeline = Pipeline(
-        steps=[
-            ("imputer", SimpleImputer(strategy="median")),
-            ("scaler", StandardScaler()),
-        ]
-    )
-
-    categorical_pipeline = Pipeline(
-        steps=[
-            ("imputer", SimpleImputer(strategy="most_frequent")),
-            ("onehot", OneHotEncoder(handle_unknown="ignore")),
-        ]
-    )
-
-    preprocessor = ColumnTransformer(
-        transformers=[
-            ("num", numeric_pipeline, numerical_cols),
-            ("cat", categorical_pipeline, categorical_cols),
-        ]
-    )
-
-    return preprocessor
+from src.data import load_data, prepare_features_and_target, split_data, get_feature_types
+from src.models import build_model_pipelines
+from src.evaluate import (
+    evaluate_model,
+    save_metrics_table,
+    save_classification_report,
+    save_confusion_matrix,
+    save_roc_curve,
+    save_precision_recall_curve,
+    save_model,
+)
+from src.utils import ensure_directories, setup_logging
 
 
-def build_model_pipeline(X: pd.DataFrame) -> Pipeline:
-    preprocessor = build_preprocessor(X)
+def run_training_pipeline():
+    ensure_directories([REPORTS_DIR, METRICS_DIR, FIGURES_DIR, LOGS_DIR, MODELS_DIR])
 
-    model = RandomForestClassifier(
-        n_estimators=300,
-        max_depth=8,
-        random_state=42,
-        class_weight="balanced",
-        n_jobs=-1,
-    )
+    logger = setup_logging(LOGS_DIR / "training.log")
+    logger.info("Starting bank churn training pipeline")
 
-    pipeline = Pipeline(
-        steps=[
-            ("preprocessor", preprocessor),
-            ("model", model),
-        ]
-    )
+    logger.info("Loading dataset from %s", DATA_PATH)
+    df = load_data(DATA_PATH)
+    logger.info("Dataset loaded with shape: %s", df.shape)
 
-    return pipeline
+    missing_values = int(df.isna().sum().sum())
+    duplicate_rows = int(df.duplicated().sum())
+    logger.info("Total missing values: %d", missing_values)
+    logger.info("Duplicate rows: %d", duplicate_rows)
 
-
-def evaluate_model(model: Pipeline, X_test: pd.DataFrame, y_test: pd.Series) -> dict:
-    y_pred = model.predict(X_test)
-    y_proba = model.predict_proba(X_test)[:, 1]
-
-    metrics = {
-        "accuracy": round(accuracy_score(y_test, y_pred), 4),
-        "precision": round(precision_score(y_test, y_pred), 4),
-        "recall": round(recall_score(y_test, y_pred), 4),
-        "f1": round(f1_score(y_test, y_pred), 4),
-        "roc_auc": round(roc_auc_score(y_test, y_proba), 4),
-    }
-
-    report = classification_report(y_test, y_pred, output_dict=True)
-    return metrics, report
-
-
-def train_and_save_model() -> None:
-    ensure_dir(MODELS_DIR)
-    ensure_dir(REPORTS_DIR)
-
-    df = load_data()
     X, y = prepare_features_and_target(df)
+    logger.info("Prepared features and target")
+    logger.info("Feature matrix shape: %s", X.shape)
+    logger.info("Target distribution: %s", y.value_counts(normalize=True).to_dict())
+
+    categorical_features, numerical_features = get_feature_types(X)
+    logger.info("Numerical features (%d): %s", len(numerical_features), numerical_features)
+    logger.info("Categorical features (%d): %s", len(categorical_features), categorical_features)
+
     X_train, X_test, y_train, y_test = split_data(X, y)
+    logger.info("Train shape: %s | Test shape: %s", X_train.shape, X_test.shape)
 
-    pipeline = build_model_pipeline(X_train)
-    pipeline.fit(X_train, y_train)
+    model_pipelines = build_model_pipelines(
+        numerical_features=numerical_features,
+        categorical_features=categorical_features,
+        random_state=RANDOM_STATE,
+    )
 
-    metrics, report = evaluate_model(pipeline, X_test, y_test)
+    benchmark_results = []
+    fitted_models = {}
 
-    model_path = MODELS_DIR / "churn_model.joblib"
-    metrics_path = REPORTS_DIR / "metrics.json"
-    report_path = REPORTS_DIR / "classification_report.json"
+    for model_name, pipeline in model_pipelines.items():
+        logger.info("Training model: %s", model_name)
 
-    joblib.dump(pipeline, model_path)
-    save_json(metrics, metrics_path)
-    save_json(report, report_path)
+        pipeline.fit(X_train, y_train)
+        fitted_models[model_name] = pipeline
 
-    print("Training complete.")
-    print(f"Model saved to: {model_path}")
-    print(f"Metrics saved to: {metrics_path}")
-    print("Metrics:")
-    for key, value in metrics.items():
-        print(f"  {key}: {value}")
+        metrics, y_pred, y_proba, report_dict = evaluate_model(pipeline, X_test, y_test)
+        metrics["model"] = model_name
+        benchmark_results.append(metrics)
+
+        logger.info("Metrics for %s: %s", model_name, metrics)
+
+        save_classification_report(
+            report_dict,
+            REPORTS_DIR / f"{model_name}_classification_report.json",
+        )
+        save_confusion_matrix(
+            y_test,
+            y_pred,
+            FIGURES_DIR / f"{model_name}_confusion_matrix.png",
+        )
+        save_roc_curve(
+            pipeline,
+            X_test,
+            y_test,
+            FIGURES_DIR / f"{model_name}_roc_curve.png",
+        )
+        save_precision_recall_curve(
+            pipeline,
+            X_test,
+            y_test,
+            FIGURES_DIR / f"{model_name}_pr_curve.png",
+        )
+
+    benchmark_df = save_metrics_table(
+        benchmark_results,
+        BENCHMARK_CSV,
+        BENCHMARK_JSON,
+    )
+
+    best_model_name = benchmark_df.iloc[0]["model"]
+    best_model = fitted_models[best_model_name]
+
+    save_model(best_model, MODELS_DIR / BEST_MODEL_FILENAME)
+
+    logger.info("Best model selected: %s", best_model_name)
+    logger.info("Benchmark saved to: %s and %s", BENCHMARK_CSV, BENCHMARK_JSON)
+    logger.info("Best model saved to: %s", MODELS_DIR / BEST_MODEL_FILENAME)
+    logger.info("Training pipeline completed successfully")
+
+    return benchmark_df, best_model_name
